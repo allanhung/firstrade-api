@@ -81,6 +81,38 @@ def get_account_id(account_id: Optional[str] = None) -> str:
     raise ValueError("No account specified and no default account available")
 
 
+def force_relogin():
+    """Force re-login by clearing session state."""
+    state.session = None
+    state.account_data = None
+    state.order_handler = None
+    state.default_account = None
+    return init_session()
+
+
+def is_auth_error(error: Exception) -> bool:
+    """Check if error indicates authentication failure."""
+    error_str = str(error).lower()
+    auth_keywords = ["401", "unauthorized", "session", "expired", "login", "authentication"]
+    return any(keyword in error_str for keyword in auth_keywords)
+
+
+def check_response_auth_error(result) -> bool:
+    """Check if API response indicates authentication failure."""
+    if isinstance(result, dict):
+        status_code = result.get("statusCode")
+        error = result.get("error", "").lower()
+        message = result.get("message", "").lower()
+        if status_code == 401 or "unauthorized" in error or "session" in message:
+            return True
+    return False
+
+
+class AuthError(Exception):
+    """Raised when authentication fails."""
+    pass
+
+
 # Create MCP server
 server = Server("firstrade-mcp")
 
@@ -303,127 +335,144 @@ async def list_tools():
     ]
 
 
+def _check_and_return(result):
+    """Check result for auth errors and return or raise."""
+    if check_response_auth_error(result):
+        raise AuthError(f"Authentication failed: {result.get('message', 'Unknown error')}")
+    return result
+
+
+def _execute_tool(name: str, arguments: dict):
+    """Execute a tool and return the result. Raises exception on error."""
+    init_session()
+
+    if name == "get_accounts":
+        return {
+            "account_numbers": state.account_data.account_numbers,
+            "account_balances": state.account_data.account_balances,
+        }
+
+    elif name == "get_account_balances":
+        account_id = get_account_id(arguments.get("account_id"))
+        return _check_and_return(state.account_data.get_account_balances(account_id))
+
+    elif name == "get_positions":
+        account_id = get_account_id(arguments.get("account_id"))
+        return _check_and_return(state.account_data.get_positions(account_id))
+
+    elif name == "get_orders":
+        account_id = get_account_id(arguments.get("account_id"))
+        return _check_and_return(state.account_data.get_orders(account_id))
+
+    elif name == "get_account_history":
+        account_id = get_account_id(arguments.get("account_id"))
+        date_range = arguments.get("date_range", "ytd")
+        custom_range = None
+        if date_range == "cust":
+            start_date = arguments.get("start_date")
+            end_date = arguments.get("end_date")
+            if not start_date or not end_date:
+                raise ValueError("start_date and end_date required for custom range")
+            custom_range = [start_date, end_date]
+        return _check_and_return(state.account_data.get_account_history(account_id, date_range, custom_range))
+
+    elif name == "get_quote":
+        symbol = arguments["symbol"].upper()
+        account_id = get_account_id(arguments.get("account_id"))
+        quote = symbols.SymbolQuote(state.session, account_id, symbol)
+        return {
+            "symbol": quote.symbol,
+            "company_name": quote.company_name,
+            "exchange": quote.exchange,
+            "bid": quote.bid,
+            "ask": quote.ask,
+            "last": quote.last,
+            "change": quote.change,
+            "high": quote.high,
+            "low": quote.low,
+            "volume": quote.volume,
+            "open": quote.open,
+            "quote_time": quote.quote_time,
+            "is_fractional": quote.is_fractional,
+            "has_option": quote.has_option,
+        }
+
+    elif name == "get_option_dates":
+        symbol = arguments["symbol"].upper()
+        option_quote = symbols.OptionQuote(state.session, symbol)
+        return _check_and_return(option_quote.option_dates)
+
+    elif name == "get_option_chain":
+        symbol = arguments["symbol"].upper()
+        exp_date = str(arguments["exp_date"])  # Convert to string in case it's passed as int
+        option_quote = symbols.OptionQuote(state.session, symbol)
+        return _check_and_return(option_quote.get_option_quote(symbol, exp_date))
+
+    elif name == "get_option_greeks":
+        symbol = arguments["symbol"].upper()
+        exp_date = str(arguments["exp_date"])  # Convert to string in case it's passed as int
+        option_quote = symbols.OptionQuote(state.session, symbol)
+        return _check_and_return(option_quote.get_greek_options(symbol, exp_date))
+
+    elif name == "place_order":
+        account_id = get_account_id(arguments.get("account_id"))
+        symbol = arguments["symbol"].upper()
+
+        # Map string to enum
+        price_type_map = {
+            "MARKET": order.PriceType.MARKET,
+            "LIMIT": order.PriceType.LIMIT,
+            "STOP": order.PriceType.STOP,
+            "STOP_LIMIT": order.PriceType.STOP_LIMIT,
+        }
+        order_type_map = {
+            "BUY": order.OrderType.BUY,
+            "SELL": order.OrderType.SELL,
+            "SELL_SHORT": order.OrderType.SELL_SHORT,
+            "BUY_TO_COVER": order.OrderType.BUY_TO_COVER,
+        }
+        duration_map = {
+            "DAY": order.Duration.DAY,
+            "GT90": order.Duration.GT90,
+            "PRE_MARKET": order.Duration.PRE_MARKET,
+            "AFTER_MARKET": order.Duration.AFTER_MARKET,
+        }
+
+        return _check_and_return(state.order_handler.place_order(
+            account=account_id,
+            symbol=symbol,
+            price_type=price_type_map[arguments["price_type"]],
+            order_type=order_type_map[arguments["order_type"]],
+            duration=duration_map.get(arguments.get("duration", "DAY"), order.Duration.DAY),
+            quantity=arguments["quantity"],
+            price=arguments.get("price", 0.0),
+            stop_price=arguments.get("stop_price"),
+            dry_run=arguments.get("dry_run", True),
+        ))
+
+    elif name == "cancel_order":
+        order_id = arguments["order_id"]
+        return _check_and_return(state.account_data.cancel_order(order_id))
+
+    else:
+        raise ValueError(f"Unknown tool: {name}")
+
+
 @server.call_tool()
 async def call_tool(name: str, arguments: dict):
-    """Handle tool calls."""
+    """Handle tool calls with auto re-login on auth errors."""
     try:
-        # Initialize session if needed
-        init_session()
-
-        if name == "get_accounts":
-            result = {
-                "account_numbers": state.account_data.account_numbers,
-                "account_balances": state.account_data.account_balances,
-            }
-
-        elif name == "get_account_balances":
-            account_id = get_account_id(arguments.get("account_id"))
-            result = state.account_data.get_account_balances(account_id)
-
-        elif name == "get_positions":
-            account_id = get_account_id(arguments.get("account_id"))
-            result = state.account_data.get_positions(account_id)
-
-        elif name == "get_orders":
-            account_id = get_account_id(arguments.get("account_id"))
-            result = state.account_data.get_orders(account_id)
-
-        elif name == "get_account_history":
-            account_id = get_account_id(arguments.get("account_id"))
-            date_range = arguments.get("date_range", "ytd")
-            custom_range = None
-            if date_range == "cust":
-                start_date = arguments.get("start_date")
-                end_date = arguments.get("end_date")
-                if not start_date or not end_date:
-                    raise ValueError("start_date and end_date required for custom range")
-                custom_range = [start_date, end_date]
-            result = state.account_data.get_account_history(account_id, date_range, custom_range)
-
-        elif name == "get_quote":
-            symbol = arguments["symbol"].upper()
-            account_id = get_account_id(arguments.get("account_id"))
-            quote = symbols.SymbolQuote(state.session, account_id, symbol)
-            result = {
-                "symbol": quote.symbol,
-                "company_name": quote.company_name,
-                "exchange": quote.exchange,
-                "bid": quote.bid,
-                "ask": quote.ask,
-                "last": quote.last,
-                "change": quote.change,
-                "high": quote.high,
-                "low": quote.low,
-                "volume": quote.volume,
-                "open": quote.open,
-                "quote_time": quote.quote_time,
-                "is_fractional": quote.is_fractional,
-                "has_option": quote.has_option,
-            }
-
-        elif name == "get_option_dates":
-            symbol = arguments["symbol"].upper()
-            option_quote = symbols.OptionQuote(state.session, symbol)
-            result = option_quote.option_dates
-
-        elif name == "get_option_chain":
-            symbol = arguments["symbol"].upper()
-            exp_date = str(arguments["exp_date"])  # Convert to string in case it's passed as int
-            option_quote = symbols.OptionQuote(state.session, symbol)
-            result = option_quote.get_option_quote(symbol, exp_date)
-
-        elif name == "get_option_greeks":
-            symbol = arguments["symbol"].upper()
-            exp_date = str(arguments["exp_date"])  # Convert to string in case it's passed as int
-            option_quote = symbols.OptionQuote(state.session, symbol)
-            result = option_quote.get_greek_options(symbol, exp_date)
-
-        elif name == "place_order":
-            account_id = get_account_id(arguments.get("account_id"))
-            symbol = arguments["symbol"].upper()
-
-            # Map string to enum
-            price_type_map = {
-                "MARKET": order.PriceType.MARKET,
-                "LIMIT": order.PriceType.LIMIT,
-                "STOP": order.PriceType.STOP,
-                "STOP_LIMIT": order.PriceType.STOP_LIMIT,
-            }
-            order_type_map = {
-                "BUY": order.OrderType.BUY,
-                "SELL": order.OrderType.SELL,
-                "SELL_SHORT": order.OrderType.SELL_SHORT,
-                "BUY_TO_COVER": order.OrderType.BUY_TO_COVER,
-            }
-            duration_map = {
-                "DAY": order.Duration.DAY,
-                "GT90": order.Duration.GT90,
-                "PRE_MARKET": order.Duration.PRE_MARKET,
-                "AFTER_MARKET": order.Duration.AFTER_MARKET,
-            }
-
-            result = state.order_handler.place_order(
-                account=account_id,
-                symbol=symbol,
-                price_type=price_type_map[arguments["price_type"]],
-                order_type=order_type_map[arguments["order_type"]],
-                duration=duration_map.get(arguments.get("duration", "DAY"), order.Duration.DAY),
-                quantity=arguments["quantity"],
-                price=arguments.get("price", 0.0),
-                stop_price=arguments.get("stop_price"),
-                dry_run=arguments.get("dry_run", True),
-            )
-
-        elif name == "cancel_order":
-            order_id = arguments["order_id"]
-            result = state.account_data.cancel_order(order_id)
-
-        else:
-            raise ValueError(f"Unknown tool: {name}")
-
+        result = _execute_tool(name, arguments)
         return [TextContent(type="text", text=json.dumps(result, indent=2))]
-
     except Exception as e:
+        if isinstance(e, AuthError) or is_auth_error(e):
+            # Auth error, try re-login and retry once
+            try:
+                force_relogin()
+                result = _execute_tool(name, arguments)
+                return [TextContent(type="text", text=json.dumps(result, indent=2))]
+            except Exception as retry_error:
+                return [TextContent(type="text", text=f"Error after re-login: {retry_error}")]
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
